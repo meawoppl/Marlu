@@ -1431,39 +1431,19 @@ mod tests {
                     .position(|description| description == &col_name)
                     .expect(format!("could not find a column with the name {}", col_name).as_str());
 
-                let mut status = 0;
-                let mut left_cell_vector: Vec<f64> = vec![0.0; len as usize];
-                let mut right_cell_vector: Vec<f64> = vec![0.0; len as usize];
+                let col_name = &$col_descriptions[col_num];
 
                 for row_idx in 0..$row_len {
-                    unsafe {
-                        fitsio_sys::ffgcvd(
-                            $left_fptr.as_raw(),
-                            (col_num + 1) as _,
-                            (row_idx + 1) as _,
-                            1,
-                            len,
-                            0 as _,
-                            left_cell_vector.as_mut_ptr() as _,
-                            &mut 0,
-                            &mut status,
-                        );
-                        fits_check_status(status).unwrap();
-                        fitsio_sys::ffgcvd(
-                            $right_fptr.as_raw(),
-                            (col_num + 1) as _,
-                            (row_idx + 1) as _,
-                            1,
-                            len,
-                            0 as _,
-                            right_cell_vector.as_mut_ptr() as _,
-                            &mut 0,
-                            &mut status,
-                        );
-                        fits_check_status(status).unwrap();
-                    }
+                    let left_cell_vector: Vec<f64> = $left_hdu
+                        .read_col_range($left_fptr, col_name, &(row_idx..row_idx + 1))
+                        .unwrap();
+                    let right_cell_vector: Vec<f64> = $right_hdu
+                        .read_col_range($right_fptr, col_name, &(row_idx..row_idx + 1))
+                        .unwrap();
                     for (cell_idx, (&left_cell, &right_cell)) in
-                        izip!(&left_cell_vector, &right_cell_vector).enumerate()
+                        izip!(&left_cell_vector, &right_cell_vector)
+                            .take(len as usize)
+                            .enumerate()
                     {
                         assert!(
                             abs_diff_eq!(left_cell, right_cell, epsilon = 1e-7),
