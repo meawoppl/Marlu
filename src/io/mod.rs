@@ -9,8 +9,10 @@ use crate::{context::VisContext, Jones};
 use error::IOError;
 
 cfg_if::cfg_if! {
-    if #[cfg(feature = "cfitsio")] {
+    if #[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))] {
         pub mod uvfits;
+        #[cfg(feature = "fitsio-pure")]
+        mod uvfits_pure;
 
         pub use error::UvfitsWriteError;
         pub use uvfits::UvfitsWriter;

@@ -24,6 +24,11 @@ default = ["mwalib", "ms"]
 # Link against cfitsio, enabling uvfits IO code
 cfitsio = ["fitsio", "fitsio-sys"]
 
+# Enable uvfits IO code on the pure-Rust fitsio-pure crate instead of cfitsio,
+# and read with mwalib's "fitsio-pure" feature if mwalib is enabled. Takes
+# precedence over cfitsio when both are enabled.
+fitsio-pure = ["dep:fitsio-pure", "mwalib?/fitsio-pure"]
+
 # Provide mwalib convenience functions (requires cfitsio)
 mwalib = ["dep:mwalib", "cfitsio"]
 
@@ -57,6 +62,9 @@ thiserror = "2.0"
 # "cfitsio" feature
 fitsio = { version = "0.21.6", optional = true }
 fitsio-sys = { version = "~0.5", optional = true }
+
+# "fitsio-pure" feature
+fitsio-pure = { version = "0.25.0", features = ["compat"], optional = true }
 
 # "mwalib" feature
 mwalib = { version = "3.0.2", optional = true }

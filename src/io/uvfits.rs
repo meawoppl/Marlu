@@ -6,15 +6,22 @@
 
 use std::{
     borrow::Cow,
-    ffi::CString,
-    os::raw::c_char,
     path::{Path, PathBuf},
 };
+#[cfg(not(feature = "fitsio-pure"))]
+use std::{ffi::CString, os::raw::c_char};
 
 use erfa::{aliases::eraGst06a, constants::ERFA_DJM0};
+#[cfg(not(feature = "fitsio-pure"))]
 use fitsio::errors::check_status as fits_check_status;
-use fitsio_sys;
-use itertools::{izip, Itertools};
+#[cfg(feature = "fitsio-pure")]
+use fitsio_pure::{
+    bintable::BinaryColumnData,
+    value::{cfitsio_rounded, Value},
+};
+use itertools::izip;
+#[cfg(not(feature = "fitsio-pure"))]
+use itertools::Itertools;
 use log::trace;
 
 use super::{
@@ -31,6 +38,19 @@ use crate::{
     HADec, History, Jones, LatLngHeight, RADec, VisContext, XyzGeodetic, UVW,
 };
 
+#[cfg(feature = "fitsio-pure")]
+use super::uvfits_pure::{self, UvfitsFile};
+
+/// The file being written: a cfitsio file pointer or, with the "fitsio-pure"
+/// feature, fitsio-pure's streaming uvfits writer.
+#[cfg(not(feature = "fitsio-pure"))]
+type FitsOut = *mut fitsio_sys::fitsfile;
+#[cfg(feature = "fitsio-pure")]
+type FitsOut = UvfitsFile;
+
+/// The FITS library's error type.
+type FitsError = crate::fits_backend::errors::Error;
+
 const NUM_FLOATS_PER_POL: usize = 3;
 const GROUP_PARAMS: [&str; 7] = ["UU", "VV", "WW", "BASELINE", "DATE", "DATE", "INTTIM"];
 
@@ -42,6 +62,7 @@ fn get_truncated_date_string(epoch: Epoch) -> String {
 }
 
 /// Helper function to convert strings into pointers of C strings.
+#[cfg(not(feature = "fitsio-pure"))]
 fn rust_strings_to_c_strings<T: AsRef<str>>(
     strings: &[T],
 ) -> Result<Vec<*mut c_char>, std::ffi::NulError> {
@@ -54,6 +75,7 @@ fn rust_strings_to_c_strings<T: AsRef<str>>(
     Ok(c_strings)
 }
 
+#[cfg(not(feature = "fitsio-pure"))]
 fn deallocate_rust_c_strings(c_string_ptrs: Vec<*mut c_char>) {
     unsafe {
         for ptr in c_string_ptrs {
@@ -150,7 +172,7 @@ pub struct UvfitsWriter {
     path: PathBuf,
 
     /// The FITS file pointer.
-    fptr: *mut fitsio_sys::fitsfile,
+    fptr: FitsOut,
 
     /// A buffer for writing visibilities. Make sure it's private and only one
     /// thread can use it at a time (which should be the case as Rust won't let
@@ -283,47 +305,59 @@ impl UvfitsWriter {
             std::fs::remove_file(path)?;
         }
 
-        // Create a new fits file.
-        let mut status = 0;
-        let c_path = CString::new(path.to_str().unwrap())?;
-        let mut fptr = std::ptr::null_mut();
-        trace!("initialising fits file with fitsio_sys ({:?})", &path);
-        unsafe {
-            // ffinit = fits_create_file
-            fitsio_sys::ffinit(
-                &mut fptr,       /* O - FITS file pointer                   */
-                c_path.as_ptr(), /* I - name of file to create              */
-                &mut status,     /* IO - error status                       */
-            );
-        }
-        fits_check_status(status)?;
+        // Create a new fits file. With fitsio-pure, the header is written
+        // once all of its keys are known, at the end of this function.
+        #[cfg(feature = "fitsio-pure")]
+        let mut fptr = UvfitsFile::create(path)?;
+        #[cfg(not(feature = "fitsio-pure"))]
+        let mut fptr = {
+            let mut status = 0;
+            let c_path = CString::new(path.to_str().unwrap())?;
+            let mut fptr = std::ptr::null_mut();
+            trace!("initialising fits file with fitsio_sys ({:?})", &path);
+            unsafe {
+                // ffinit = fits_create_file
+                fitsio_sys::ffinit(
+                    &mut fptr,       /* O - FITS file pointer                   */
+                    c_path.as_ptr(), /* I - name of file to create              */
+                    &mut status,     /* IO - error status                       */
+                );
+            }
+            fits_check_status(status)?;
+            fptr
+        };
 
         // Initialise the group header. Copied from cotter. -32 means FLOAT_IMG.
         let num_group_params = GROUP_PARAMS.len() - if time_resolution.is_some() { 0 } else { 1 };
+        #[cfg_attr(feature = "fitsio-pure", allow(unused_mut))]
         let mut naxes = [0, NUM_FLOATS_PER_POL as i64, 4, num_chans as i64, 1, 1];
         let total_num_rows = num_timesteps * num_baselines;
         assert!(
             total_num_rows > 0,
             "num_timesteps * num_baselines must be > 0"
         );
-        trace!("setting group params in fits file ({:?})", &path);
-        unsafe {
-            // ffphpr = fits_write_grphdr
-            fitsio_sys::ffphpr(
-                fptr,                    /* I - FITS file pointer                        */
-                1,                       /* I - does file conform to FITS standard? 1/0  */
-                -32,                     /* I - number of bits per data value pixel      */
-                naxes.len() as _,        /* I - number of axes in the data array         */
-                naxes.as_mut_ptr(),      /* I - length of each data axis                 */
-                num_group_params as i64, /* I - number of group parameters (usually 0)   */
-                total_num_rows as i64,   /* I - number of random groups (usually 1 or 0) */
-                1,                       /* I - may FITS file have extensions?           */
-                &mut status,             /* IO - error status                            */
-            );
+        #[cfg(not(feature = "fitsio-pure"))]
+        {
+            let mut status = 0;
+            trace!("setting group params in fits file ({:?})", &path);
+            unsafe {
+                // ffphpr = fits_write_grphdr
+                fitsio_sys::ffphpr(
+                    fptr,                    /* I - FITS file pointer                        */
+                    1,                       /* I - does file conform to FITS standard? 1/0  */
+                    -32,                     /* I - number of bits per data value pixel      */
+                    naxes.len() as _,        /* I - number of axes in the data array         */
+                    naxes.as_mut_ptr(),      /* I - length of each data axis                 */
+                    num_group_params as i64, /* I - number of group parameters (usually 0)   */
+                    total_num_rows as i64,   /* I - number of random groups (usually 1 or 0) */
+                    1,                       /* I - may FITS file have extensions?           */
+                    &mut status,             /* IO - error status                            */
+                );
+            }
+            fits_check_status(status)?;
         }
-        fits_check_status(status)?;
 
-        fits_write_double(fptr, "BSCALE", 1.0, None)?;
+        fits_write_double(&mut fptr, "BSCALE", 1.0, None)?;
 
         // Set header names and scales.
         let mut pzero_date_set = false;
@@ -331,15 +365,15 @@ impl UvfitsWriter {
             let i = i + 1;
             match param {
                 "DATE" => {
-                    fits_write_string(fptr, &format!("PTYPE{i}"), param, None)?;
-                    fits_write_double(fptr, &format!("PSCAL{i}"), 1.0, None)?;
+                    fits_write_string(&mut fptr, &format!("PTYPE{i}"), param, None)?;
+                    fits_write_double(&mut fptr, &format!("PSCAL{i}"), 1.0, None)?;
                     // Don't set the PZERO for the second date.
                     if pzero_date_set {
-                        fits_write_double(fptr, &format!("PZERO{i}"), 0.0, None)?;
+                        fits_write_double(&mut fptr, &format!("PZERO{i}"), 0.0, None)?;
                     } else {
                         // Set the zero level for the DATE column.
                         fits_write_double(
-                            fptr,
+                            &mut fptr,
                             &format!("PZERO{i}"),
                             start_epoch.to_jde_utc_days().floor() + 0.5,
                             None,
@@ -349,62 +383,62 @@ impl UvfitsWriter {
                 }
                 "INTTIM" => {
                     if time_resolution.is_some() {
-                        fits_write_string(fptr, &format!("PTYPE{i}"), param, None)?;
-                        fits_write_double(fptr, &format!("PSCAL{i}"), 1.0, None)?;
-                        fits_write_double(fptr, &format!("PZERO{i}"), 0.0, None)?;
+                        fits_write_string(&mut fptr, &format!("PTYPE{i}"), param, None)?;
+                        fits_write_double(&mut fptr, &format!("PSCAL{i}"), 1.0, None)?;
+                        fits_write_double(&mut fptr, &format!("PZERO{i}"), 0.0, None)?;
                     }
                 }
                 _ => {
-                    fits_write_string(fptr, &format!("PTYPE{i}"), param, None)?;
-                    fits_write_double(fptr, &format!("PSCAL{i}"), 1.0, None)?;
-                    fits_write_double(fptr, &format!("PZERO{i}"), 0.0, None)?;
+                    fits_write_string(&mut fptr, &format!("PTYPE{i}"), param, None)?;
+                    fits_write_double(&mut fptr, &format!("PSCAL{i}"), 1.0, None)?;
+                    fits_write_double(&mut fptr, &format!("PZERO{i}"), 0.0, None)?;
                 }
             }
         }
         fits_write_string(
-            fptr,
+            &mut fptr,
             "DATE-OBS",
             &get_truncated_date_string(start_epoch),
             None,
         )?;
 
         // Dimensions.
-        fits_write_string(fptr, "CTYPE2", "COMPLEX", None)?;
-        fits_write_double(fptr, "CRVAL2", 1.0, None)?;
-        fits_write_double(fptr, "CRPIX2", 1.0, None)?;
-        fits_write_double(fptr, "CDELT2", 1.0, None)?;
+        fits_write_string(&mut fptr, "CTYPE2", "COMPLEX", None)?;
+        fits_write_double(&mut fptr, "CRVAL2", 1.0, None)?;
+        fits_write_double(&mut fptr, "CRPIX2", 1.0, None)?;
+        fits_write_double(&mut fptr, "CDELT2", 1.0, None)?;
 
         // Linearly polarised.
-        fits_write_string(fptr, "CTYPE3", "STOKES", None)?;
-        fits_write_int(fptr, "CRVAL3", -5, None)?;
-        fits_write_int(fptr, "CDELT3", -1, None)?;
-        fits_write_double(fptr, "CRPIX3", 1.0, None)?;
+        fits_write_string(&mut fptr, "CTYPE3", "STOKES", None)?;
+        fits_write_int(&mut fptr, "CRVAL3", -5, None)?;
+        fits_write_int(&mut fptr, "CDELT3", -1, None)?;
+        fits_write_double(&mut fptr, "CRPIX3", 1.0, None)?;
 
-        fits_write_string(fptr, "CTYPE4", "FREQ", None)?;
-        fits_write_double(fptr, "CRVAL4", centre_freq_hz, None)?;
-        fits_write_double(fptr, "CDELT4", fine_chan_width_hz, None)?;
-        fits_write_int(fptr, "CRPIX4", centre_freq_chan as i64 + 1, None)?;
+        fits_write_string(&mut fptr, "CTYPE4", "FREQ", None)?;
+        fits_write_double(&mut fptr, "CRVAL4", centre_freq_hz, None)?;
+        fits_write_double(&mut fptr, "CDELT4", fine_chan_width_hz, None)?;
+        fits_write_int(&mut fptr, "CRPIX4", centre_freq_chan as i64 + 1, None)?;
 
-        fits_write_string(fptr, "CTYPE5", "RA", None)?;
-        fits_write_double(fptr, "CRVAL5", phase_centre.ra.to_degrees(), None)?;
-        fits_write_int(fptr, "CDELT5", 1, None)?;
-        fits_write_int(fptr, "CRPIX5", 1, None)?;
+        fits_write_string(&mut fptr, "CTYPE5", "RA", None)?;
+        fits_write_double(&mut fptr, "CRVAL5", phase_centre.ra.to_degrees(), None)?;
+        fits_write_int(&mut fptr, "CDELT5", 1, None)?;
+        fits_write_int(&mut fptr, "CRPIX5", 1, None)?;
 
-        fits_write_string(fptr, "CTYPE6", "DEC", None)?;
-        fits_write_double(fptr, "CRVAL6", phase_centre.dec.to_degrees(), None)?;
-        fits_write_int(fptr, "CDELT6", 1, None)?;
-        fits_write_int(fptr, "CRPIX6", 1, None)?;
+        fits_write_string(&mut fptr, "CTYPE6", "DEC", None)?;
+        fits_write_double(&mut fptr, "CRVAL6", phase_centre.dec.to_degrees(), None)?;
+        fits_write_int(&mut fptr, "CDELT6", 1, None)?;
+        fits_write_int(&mut fptr, "CRPIX6", 1, None)?;
 
-        fits_write_double(fptr, "OBSRA", phase_centre.ra.to_degrees(), None)?;
-        fits_write_double(fptr, "OBSDEC", phase_centre.dec.to_degrees(), None)?;
-        fits_write_double(fptr, "EPOCH", 2000.0, None)?;
+        fits_write_double(&mut fptr, "OBSRA", phase_centre.ra.to_degrees(), None)?;
+        fits_write_double(&mut fptr, "OBSDEC", phase_centre.dec.to_degrees(), None)?;
+        fits_write_double(&mut fptr, "EPOCH", 2000.0, None)?;
 
-        fits_write_string(fptr, "OBJECT", obs_name.unwrap_or("Undefined"), None)?;
-        fits_write_string(fptr, "TELESCOP", "MWA", None)?;
-        fits_write_string(fptr, "INSTRUME", "MWA", None)?;
+        fits_write_string(&mut fptr, "OBJECT", obs_name.unwrap_or("Undefined"), None)?;
+        fits_write_string(&mut fptr, "TELESCOP", "MWA", None)?;
+        fits_write_string(&mut fptr, "INSTRUME", "MWA", None)?;
 
         // This is apparently required...
-        fits_write_history(fptr, "AIPS WTSCAL =  1.0")?;
+        fits_write_history(&mut fptr, "AIPS WTSCAL =  1.0")?;
 
         // Add in version information
         let software = match history {
@@ -418,21 +452,28 @@ impl UvfitsWriter {
         match history {
             Some(history) => {
                 for comment in &history.as_comments() {
-                    fits_write_comment(fptr, comment)?;
+                    fits_write_comment(&mut fptr, comment)?;
                 }
             }
             None => {
-                fits_write_comment(fptr, &format!("Created by {software}",))?;
+                fits_write_comment(&mut fptr, &format!("Created by {software}",))?;
             }
         };
 
-        fits_write_string(fptr, "SOFTWARE", &software, None)?;
+        fits_write_string(&mut fptr, "SOFTWARE", &software, None)?;
         fits_write_string(
-            fptr,
+            &mut fptr,
             "GITLABEL",
             &format!("v{}", env!("CARGO_PKG_VERSION")),
             None,
         )?;
+
+        #[cfg(feature = "fitsio-pure")]
+        {
+            let naxes = naxes[1..].iter().map(|&n| n as usize).collect::<Vec<_>>();
+            trace!("writing the uvfits header ({path:?})");
+            fptr.start_groups(&naxes, num_group_params, total_num_rows)?;
+        }
 
         Ok(UvfitsWriter {
             path: path.to_path_buf(),
@@ -521,83 +562,90 @@ impl UvfitsWriter {
         let col_units = [
             "", "METERS", "", "", "METERS", "", "DEGREES", "", "", "DEGREES", "",
         ];
-        let mut c_col_names = rust_strings_to_c_strings(&col_names)?;
-        let mut c_col_formats = rust_strings_to_c_strings(&col_formats)?;
-        let mut c_col_units = rust_strings_to_c_strings(&col_units)?;
-        let extname = CString::new("AIPS AN")?;
+        #[cfg(feature = "fitsio-pure")]
+        self.fptr
+            .start_table(&col_names, &col_formats, &col_units, "AIPS AN")?;
 
-        // ffcrtb creates a new binary table in a new HDU. This should be the second
-        // HDU, so there should only be one HDU before this function is called.
-        let mut status = 0;
-        unsafe {
-            // ffcrtb = fits_create_tbl. BINARY_TBL is 2.
-            fitsio_sys::ffcrtb(
-                self.fptr,                  /* I - FITS file pointer                        */
-                2,                          /* I - type of table to create                  */
-                0,                          /* I - number of rows in the table              */
-                11,                         /* I - number of columns in the table           */
-                c_col_names.as_mut_ptr(),   /* I - name of each column                      */
-                c_col_formats.as_mut_ptr(), /* I - value of TFORMn keyword for each column  */
-                c_col_units.as_mut_ptr(),   /* I - value of TUNITn keyword for each column  */
-                extname.as_ptr(),           /* I - value of EXTNAME keyword, if any         */
-                &mut status,                /* IO - error status                            */
-            );
-        }
-        fits_check_status(status)?;
-        deallocate_rust_c_strings(c_col_names);
-        deallocate_rust_c_strings(c_col_formats);
-        deallocate_rust_c_strings(c_col_units);
+        #[cfg(not(feature = "fitsio-pure"))]
+        {
+            let mut c_col_names = rust_strings_to_c_strings(&col_names)?;
+            let mut c_col_formats = rust_strings_to_c_strings(&col_formats)?;
+            let mut c_col_units = rust_strings_to_c_strings(&col_units)?;
+            let extname = CString::new("AIPS AN")?;
 
-        // Open the newly-created HDU.
-        unsafe {
-            // ffmahd = fits_movabs_hdu
-            fitsio_sys::ffmahd(
-                self.fptr,            /* I - FITS file pointer             */
-                2,                    /* I - number of the HDU to move to  */
-                std::ptr::null_mut(), /* O - type of extension, 0, 1, or 2 */
-                &mut status,          /* IO - error status                 */
-            );
+            // ffcrtb creates a new binary table in a new HDU. This should be the second
+            // HDU, so there should only be one HDU before this function is called.
+            let mut status = 0;
+            unsafe {
+                // ffcrtb = fits_create_tbl. BINARY_TBL is 2.
+                fitsio_sys::ffcrtb(
+                    self.fptr,                  /* I - FITS file pointer                        */
+                    2,                          /* I - type of table to create                  */
+                    0,                          /* I - number of rows in the table              */
+                    11,                         /* I - number of columns in the table           */
+                    c_col_names.as_mut_ptr(),   /* I - name of each column                      */
+                    c_col_formats.as_mut_ptr(), /* I - value of TFORMn keyword for each column  */
+                    c_col_units.as_mut_ptr(),   /* I - value of TUNITn keyword for each column  */
+                    extname.as_ptr(),           /* I - value of EXTNAME keyword, if any         */
+                    &mut status,                /* IO - error status                            */
+                );
+            }
+            fits_check_status(status)?;
+            deallocate_rust_c_strings(c_col_names);
+            deallocate_rust_c_strings(c_col_formats);
+            deallocate_rust_c_strings(c_col_units);
+
+            // Open the newly-created HDU.
+            unsafe {
+                // ffmahd = fits_movabs_hdu
+                fitsio_sys::ffmahd(
+                    self.fptr,            /* I - FITS file pointer             */
+                    2,                    /* I - number of the HDU to move to  */
+                    std::ptr::null_mut(), /* O - type of extension, 0, 1, or 2 */
+                    &mut status,          /* IO - error status                 */
+                );
+            }
+            fits_check_status(status)?;
         }
-        fits_check_status(status)?;
 
         let array_xyz = self.array_pos.to_geocentric_wgs84();
 
-        fits_write_double(self.fptr, "ARRAYX", array_xyz.x, None)?;
-        fits_write_double(self.fptr, "ARRAYY", array_xyz.y, None)?;
-        fits_write_double(self.fptr, "ARRAYZ", array_xyz.z, None)?;
+        fits_write_double(&mut self.fptr, "ARRAYX", array_xyz.x, None)?;
+        fits_write_double(&mut self.fptr, "ARRAYY", array_xyz.y, None)?;
+        fits_write_double(&mut self.fptr, "ARRAYZ", array_xyz.z, None)?;
 
-        fits_write_double(self.fptr, "FREQ", self.centre_freq, None)?;
+        fits_write_double(&mut self.fptr, "FREQ", self.centre_freq, None)?;
 
         // Antenna position reference frame
-        fits_write_string(self.fptr, "FRAME", "ITRF", None)?;
+        fits_write_string(&mut self.fptr, "FRAME", "ITRF", None)?;
 
         // Get the Greenwich apparent sidereal time from ERFA.
         let mjd = self.start_epoch.to_mjd_utc_days();
         let gst = eraGst06a(ERFA_DJM0, mjd.floor(), ERFA_DJM0, mjd.floor()).to_degrees();
-        fits_write_double(self.fptr, "GSTIA0", gst, None)?;
-        fits_write_double(self.fptr, "DEGPDY", 3.60985e2, None)?; // Earth's rotation rate
+        fits_write_double(&mut self.fptr, "GSTIA0", gst, None)?;
+        fits_write_double(&mut self.fptr, "DEGPDY", 3.60985e2, None)?; // Earth's rotation rate
 
         let date_truncated = get_truncated_date_string(self.start_epoch);
-        fits_write_string(self.fptr, "RDATE", &date_truncated, None)?;
+        fits_write_string(&mut self.fptr, "RDATE", &date_truncated, None)?;
 
-        fits_write_double(self.fptr, "POLARX", 0.0, None)?;
-        fits_write_double(self.fptr, "POLARY", 0.0, None)?;
+        fits_write_double(&mut self.fptr, "POLARX", 0.0, None)?;
+        fits_write_double(&mut self.fptr, "POLARY", 0.0, None)?;
         fits_write_double(
-            self.fptr,
+            &mut self.fptr,
             "UT1UTC",
             self.dut1.to_seconds(),
             Some("UT1 - UTC, a.k.a. DUT1"),
         )?;
-        fits_write_double(self.fptr, "DATUTC", 0.0, None)?;
+        fits_write_double(&mut self.fptr, "DATUTC", 0.0, None)?;
 
         // AIPS 117 calls this TIMESYS, but Cotter calls in TIMSYS, so we do both.
-        fits_write_string(self.fptr, "TIMSYS", "UTC", None)?;
-        fits_write_string(self.fptr, "TIMESYS", "UTC", None)?;
-        fits_write_string(self.fptr, "ARRNAM", "MWA", None)?;
-        fits_write_int(self.fptr, "NUMORB", 0, None)?; // number of orbital parameters in table
-        fits_write_int(self.fptr, "NOPCAL", 3, None)?; // Nr pol calibration values / IF(N_pcal)
-        fits_write_int(self.fptr, "FREQID", -1, None)?; // Frequency setup number
-        fits_write_double(self.fptr, "IATUTC", 33.0, None)?;
+        fits_write_string(&mut self.fptr, "TIMSYS", "UTC", None)?;
+        fits_write_string(&mut self.fptr, "TIMESYS", "UTC", None)?;
+        fits_write_string(&mut self.fptr, "ARRNAM", "MWA", None)?;
+        fits_write_int(&mut self.fptr, "NUMORB", 0, None)?; // number of orbital parameters in table
+        fits_write_int(&mut self.fptr, "NOPCAL", 3, None)?; // Nr pol calibration values / IF(N_pcal)
+        fits_write_int(&mut self.fptr, "FREQID", -1, None)?; // Frequency setup number
+        fits_write_double(&mut self.fptr, "IATUTC", 33.0, None)?;
 
         // -> EXTVER
         // ---> in AIPS117:
@@ -608,7 +656,7 @@ impl UvfitsWriter {
         // ---> @derwentx: I'm pretty sure the wrong description was pasted into
         // EXTVER, and it's incorrectly being used as subarray number, when it
         // should just be the version number of the table.
-        fits_write_int(self.fptr, "EXTVER", 1, None)?;
+        fits_write_int(&mut self.fptr, "EXTVER", 1, None)?;
 
         // -> NO_IF - Number IFs (nIF)
         // ---> in AIPS117: The value of the NO IF keyword shall specify the number of spectral
@@ -618,162 +666,195 @@ impl UvfitsWriter {
         // ---> since we can only deal with one spectral window at the moment,
         //  this is fixed at 1, but this would change in
         //  https://github.com/MWATelescope/Birli/issues/13
-        fits_write_int(self.fptr, "NO_IF", 1, None)?;
+        fits_write_int(&mut self.fptr, "NO_IF", 1, None)?;
 
         // Assume the station coordinates are "right handed".
-        fits_write_string(self.fptr, "XYZHAND", "RIGHT", None)?;
+        fits_write_string(&mut self.fptr, "XYZHAND", "RIGHT", None)?;
 
-        // Write to the table row by row.
-        let mut x_c_str = CString::new("X")?.into_raw();
-        let mut y_c_str = CString::new("Y")?.into_raw();
-        for (i, (pos, name)) in self
-            .antenna_positions
-            .iter()
-            .zip_eq(self.antenna_names.iter())
-            .enumerate()
+        #[cfg(not(feature = "fitsio-pure"))]
         {
-            let row = i as i64 + 1;
-            unsafe {
-                // ANNAME. ffpcls = fits_write_col_str
-                let mut c_antenna_name = CString::new(name.as_str())?.into_raw();
-                fitsio_sys::ffpcls(
-                    self.fptr,           /* I - FITS file pointer                       */
-                    1,                   /* I - number of column to write (1 = 1st col) */
-                    row,                 /* I - first row to write (1 = 1st row)        */
-                    1,                   /* I - first vector element to write (1 = 1st) */
-                    1,                   /* I - number of strings to write              */
-                    &mut c_antenna_name, /* I - array of pointers to strings            */
-                    &mut status,         /* IO - error status                           */
-                );
-                fits_check_status(status)?;
-                drop(CString::from_raw(c_antenna_name));
+            // Write to the table row by row.
+            let mut status = 0;
+            let mut x_c_str = CString::new("X")?.into_raw();
+            let mut y_c_str = CString::new("Y")?.into_raw();
+            for (i, (pos, name)) in self
+                .antenna_positions
+                .iter()
+                .zip_eq(self.antenna_names.iter())
+                .enumerate()
+            {
+                let row = i as i64 + 1;
+                unsafe {
+                    // ANNAME. ffpcls = fits_write_col_str
+                    let mut c_antenna_name = CString::new(name.as_str())?.into_raw();
+                    fitsio_sys::ffpcls(
+                        self.fptr,           /* I - FITS file pointer                       */
+                        1,                   /* I - number of column to write (1 = 1st col) */
+                        row,                 /* I - first row to write (1 = 1st row)        */
+                        1,                   /* I - first vector element to write (1 = 1st) */
+                        1,                   /* I - number of strings to write              */
+                        &mut c_antenna_name, /* I - array of pointers to strings            */
+                        &mut status,         /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
+                    drop(CString::from_raw(c_antenna_name));
 
-                let mut c_xyz = [pos.x, pos.y, pos.z];
-                // STABXYZ. ffpcld = fits_write_col_dbl
-                fitsio_sys::ffpcld(
-                    self.fptr,          /* I - FITS file pointer                       */
-                    2,                  /* I - number of column to write (1 = 1st col) */
-                    row,                /* I - first row to write (1 = 1st row)        */
-                    1,                  /* I - first vector element to write (1 = 1st) */
-                    3,                  /* I - number of values to write               */
-                    c_xyz.as_mut_ptr(), /* I - array of values to write                */
-                    &mut status,        /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    let mut c_xyz = [pos.x, pos.y, pos.z];
+                    // STABXYZ. ffpcld = fits_write_col_dbl
+                    fitsio_sys::ffpcld(
+                        self.fptr,          /* I - FITS file pointer                       */
+                        2,                  /* I - number of column to write (1 = 1st col) */
+                        row,                /* I - first row to write (1 = 1st row)        */
+                        1,                  /* I - first vector element to write (1 = 1st) */
+                        3,                  /* I - number of values to write               */
+                        c_xyz.as_mut_ptr(), /* I - array of values to write                */
+                        &mut status,        /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // NOSTA. ffpclk = fits_write_col_int
-                fitsio_sys::ffpclk(
-                    self.fptr,         /* I - FITS file pointer                       */
-                    3,                 /* I - number of column to write (1 = 1st col) */
-                    row,               /* I - first row to write (1 = 1st row)        */
-                    1,                 /* I - first vector element to write (1 = 1st) */
-                    1,                 /* I - number of values to write               */
-                    &mut (row as i32), /* I - array of values to write                */
-                    &mut status,       /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // NOSTA. ffpclk = fits_write_col_int
+                    fitsio_sys::ffpclk(
+                        self.fptr,         /* I - FITS file pointer                       */
+                        3,                 /* I - number of column to write (1 = 1st col) */
+                        row,               /* I - first row to write (1 = 1st row)        */
+                        1,                 /* I - first vector element to write (1 = 1st) */
+                        1,                 /* I - number of values to write               */
+                        &mut (row as i32), /* I - array of values to write                */
+                        &mut status,       /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // MNTSTA
-                fitsio_sys::ffpclk(
-                    self.fptr,   /* I - FITS file pointer                       */
-                    4,           /* I - number of column to write (1 = 1st col) */
-                    row,         /* I - first row to write (1 = 1st row)        */
-                    1,           /* I - first vector element to write (1 = 1st) */
-                    1,           /* I - number of values to write               */
-                    &mut 0,      /* I - array of values to write                */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // MNTSTA
+                    fitsio_sys::ffpclk(
+                        self.fptr,   /* I - FITS file pointer                       */
+                        4,           /* I - number of column to write (1 = 1st col) */
+                        row,         /* I - first row to write (1 = 1st row)        */
+                        1,           /* I - first vector element to write (1 = 1st) */
+                        1,           /* I - number of values to write               */
+                        &mut 0,      /* I - array of values to write                */
+                        &mut status, /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // No row 5?
-                // POLTYA
-                fitsio_sys::ffpcls(
-                    self.fptr,    /* I - FITS file pointer                       */
-                    6,            /* I - number of column to write (1 = 1st col) */
-                    row,          /* I - first row to write (1 = 1st row)        */
-                    1,            /* I - first vector element to write (1 = 1st) */
-                    1,            /* I - number of strings to write              */
-                    &mut x_c_str, /* I - array of pointers to strings            */
-                    &mut status,  /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // No row 5?
+                    // POLTYA
+                    fitsio_sys::ffpcls(
+                        self.fptr,    /* I - FITS file pointer                       */
+                        6,            /* I - number of column to write (1 = 1st col) */
+                        row,          /* I - first row to write (1 = 1st row)        */
+                        1,            /* I - first vector element to write (1 = 1st) */
+                        1,            /* I - number of strings to write              */
+                        &mut x_c_str, /* I - array of pointers to strings            */
+                        &mut status,  /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // POLAA. ffpcle = fits_write_col_flt
-                fitsio_sys::ffpcle(
-                    self.fptr,   /* I - FITS file pointer                       */
-                    7,           /* I - number of column to write (1 = 1st col) */
-                    row,         /* I - first row to write (1 = 1st row)        */
-                    1,           /* I - first vector element to write (1 = 1st) */
-                    1,           /* I - number of values to write               */
-                    &mut 0.0,    /* I - array of values to write                */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // POLAA. ffpcle = fits_write_col_flt
+                    fitsio_sys::ffpcle(
+                        self.fptr,   /* I - FITS file pointer                       */
+                        7,           /* I - number of column to write (1 = 1st col) */
+                        row,         /* I - first row to write (1 = 1st row)        */
+                        1,           /* I - first vector element to write (1 = 1st) */
+                        1,           /* I - number of values to write               */
+                        &mut 0.0,    /* I - array of values to write                */
+                        &mut status, /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // POL calA
-                fitsio_sys::ffpcle(
-                    self.fptr,   /* I - FITS file pointer                       */
-                    8,           /* I - number of column to write (1 = 1st col) */
-                    row,         /* I - first row to write (1 = 1st row)        */
-                    1,           /* I - first vector element to write (1 = 1st) */
-                    1,           /* I - number of values to write               */
-                    &mut 0.0,    /* I - array of values to write                */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // POL calA
+                    fitsio_sys::ffpcle(
+                        self.fptr,   /* I - FITS file pointer                       */
+                        8,           /* I - number of column to write (1 = 1st col) */
+                        row,         /* I - first row to write (1 = 1st row)        */
+                        1,           /* I - first vector element to write (1 = 1st) */
+                        1,           /* I - number of values to write               */
+                        &mut 0.0,    /* I - array of values to write                */
+                        &mut status, /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // POLTYB
-                fitsio_sys::ffpcls(
-                    self.fptr,    /* I - FITS file pointer                       */
-                    9,            /* I - number of column to write (1 = 1st col) */
-                    row,          /* I - first row to write (1 = 1st row)        */
-                    1,            /* I - first vector element to write (1 = 1st) */
-                    1,            /* I - number of strings to write              */
-                    &mut y_c_str, /* I - array of pointers to strings            */
-                    &mut status,  /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // POLTYB
+                    fitsio_sys::ffpcls(
+                        self.fptr,    /* I - FITS file pointer                       */
+                        9,            /* I - number of column to write (1 = 1st col) */
+                        row,          /* I - first row to write (1 = 1st row)        */
+                        1,            /* I - first vector element to write (1 = 1st) */
+                        1,            /* I - number of strings to write              */
+                        &mut y_c_str, /* I - array of pointers to strings            */
+                        &mut status,  /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // POLAB.
-                fitsio_sys::ffpcle(
-                    self.fptr,   /* I - FITS file pointer                       */
-                    10,          /* I - number of column to write (1 = 1st col) */
-                    row,         /* I - first row to write (1 = 1st row)        */
-                    1,           /* I - first vector element to write (1 = 1st) */
-                    1,           /* I - number of values to write               */
-                    &mut 90.0,   /* I - array of values to write                */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // POLAB.
+                    fitsio_sys::ffpcle(
+                        self.fptr,   /* I - FITS file pointer                       */
+                        10,          /* I - number of column to write (1 = 1st col) */
+                        row,         /* I - first row to write (1 = 1st row)        */
+                        1,           /* I - first vector element to write (1 = 1st) */
+                        1,           /* I - number of values to write               */
+                        &mut 90.0,   /* I - array of values to write                */
+                        &mut status, /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
 
-                // POL calB
-                fitsio_sys::ffpcle(
-                    self.fptr,   /* I - FITS file pointer                       */
-                    11,          /* I - number of column to write (1 = 1st col) */
-                    row,         /* I - first row to write (1 = 1st row)        */
-                    1,           /* I - first vector element to write (1 = 1st) */
-                    1,           /* I - number of values to write               */
-                    &mut 0.0,    /* I - array of values to write                */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status)?;
+                    // POL calB
+                    fitsio_sys::ffpcle(
+                        self.fptr,   /* I - FITS file pointer                       */
+                        11,          /* I - number of column to write (1 = 1st col) */
+                        row,         /* I - first row to write (1 = 1st row)        */
+                        1,           /* I - first vector element to write (1 = 1st) */
+                        1,           /* I - number of values to write               */
+                        &mut 0.0,    /* I - array of values to write                */
+                        &mut status, /* IO - error status                           */
+                    );
+                    fits_check_status(status)?;
+                }
             }
+
+            // Drop some C strings.
+            unsafe {
+                drop(CString::from_raw(x_c_str));
+                drop(CString::from_raw(y_c_str));
+            }
+
+            // Close the fits file.
+            trace!("closing fits file ({})", self.path.display());
+            let mut status = 0;
+            unsafe {
+                // ffclos = fits_close_file
+                fitsio_sys::ffclos(self.fptr, &mut status);
+            }
+            fits_check_status(status)?;
         }
 
-        // Drop some C strings.
-        unsafe {
-            drop(CString::from_raw(x_c_str));
-            drop(CString::from_raw(y_c_str));
-        }
+        #[cfg(feature = "fitsio-pure")]
+        {
+            // The same rows as above, a column at a time.
+            let num_ants = self.antenna_names.len();
+            assert_eq!(num_ants, self.antenna_positions.len());
+            let columns = vec![
+                BinaryColumnData::Ascii(self.antenna_names.clone()),
+                BinaryColumnData::Double(
+                    self.antenna_positions
+                        .iter()
+                        .flat_map(|pos| [pos.x, pos.y, pos.z])
+                        .collect(),
+                ),
+                BinaryColumnData::Int((1..=num_ants as i32).collect()),
+                BinaryColumnData::Int(vec![0; num_ants]),
+                BinaryColumnData::Float(vec![0.0; num_ants]),
+                BinaryColumnData::Ascii(vec!["X".to_string(); num_ants]),
+                BinaryColumnData::Float(vec![0.0; num_ants]),
+                BinaryColumnData::Float([0.0, 0.0, 0.0].repeat(num_ants)),
+                BinaryColumnData::Ascii(vec!["Y".to_string(); num_ants]),
+                BinaryColumnData::Float(vec![90.0; num_ants]),
+                BinaryColumnData::Float([0.0, 0.0, 0.0].repeat(num_ants)),
+            ];
+            self.fptr.write_table(columns, num_ants)?;
 
-        // Close the fits file.
-        trace!("closing fits file ({})", self.path.display());
-        let mut status = 0;
-        unsafe {
-            // ffclos = fits_close_file
-            fitsio_sys::ffclos(self.fptr, &mut status);
+            trace!("closing fits file ({})", self.path.display());
+            self.fptr.close()?;
         }
-        fits_check_status(status)?;
 
         Ok(())
     }
@@ -875,7 +956,7 @@ impl UvfitsWriter {
 
         self.buffer.extend_from_slice(vis);
 
-        Self::write_vis_row_inner(self.fptr, &mut self.current_num_rows, &mut self.buffer)?;
+        Self::write_vis_row_inner(&mut self.fptr, &mut self.current_num_rows, &mut self.buffer)?;
 
         self.buffer.clear();
         Ok(())
@@ -883,23 +964,29 @@ impl UvfitsWriter {
 
     #[inline(always)]
     fn write_vis_row_inner(
-        fptr: *mut fitsio_sys::fitsfile,
+        fptr: &mut FitsOut,
         current_num_rows: &mut usize,
         vis: &mut [f32],
-    ) -> Result<(), fitsio::errors::Error> {
-        let mut status = 0;
-        unsafe {
-            // ffpgpe = fits_write_grppar_flt
-            fitsio_sys::ffpgpe(
-                fptr,                         /* I - FITS file pointer                      */
-                *current_num_rows as i64 + 1, /* I - group to write(1 = 1st group)          */
-                1,                            /* I - first vector element to write(1 = 1st) */
-                vis.len() as i64,             /* I - number of values to write              */
-                vis.as_mut_ptr(),             /* I - array of values that are written       */
-                &mut status,                  /* IO - error status                          */
-            );
+    ) -> Result<(), FitsError> {
+        #[cfg(not(feature = "fitsio-pure"))]
+        {
+            let mut status = 0;
+            unsafe {
+                // ffpgpe = fits_write_grppar_flt
+                fitsio_sys::ffpgpe(
+                    *fptr,                        /* I - FITS file pointer                      */
+                    *current_num_rows as i64 + 1, /* I - group to write(1 = 1st group)          */
+                    1,                            /* I - first vector element to write(1 = 1st) */
+                    vis.len() as i64,             /* I - number of values to write              */
+                    vis.as_mut_ptr(),             /* I - array of values that are written       */
+                    &mut status,                  /* IO - error status                          */
+                );
+            }
+            fits_check_status(status)?;
         }
-        fits_check_status(status)?;
+        // Groups are written in order, so this is the next one.
+        #[cfg(feature = "fitsio-pure")]
+        fptr.write_group(vis)?;
         *current_num_rows += 1;
         Ok(())
     }
@@ -908,14 +995,20 @@ impl UvfitsWriter {
     /// writer should have the antenna table written before closing). It would
     /// be nice to have this code inside the `Drop` method, but `Drop` code
     /// cannot fail.
-    pub fn close(self) -> Result<(), fitsio::errors::Error> {
+    #[cfg_attr(not(feature = "fitsio-pure"), allow(unused_mut))]
+    pub fn close(mut self) -> Result<(), FitsError> {
         trace!("closing fits file ({})", self.path.display());
-        let mut status = 0;
-        unsafe {
-            // ffclos = fits_close_file
-            fitsio_sys::ffclos(self.fptr, &mut status);
+        #[cfg(not(feature = "fitsio-pure"))]
+        {
+            let mut status = 0;
+            unsafe {
+                // ffclos = fits_close_file
+                fitsio_sys::ffclos(self.fptr, &mut status);
+            }
+            fits_check_status(status)
         }
-        fits_check_status(status)
+        #[cfg(feature = "fitsio-pure")]
+        self.fptr.close()
     }
 }
 
@@ -1120,7 +1213,11 @@ impl VisWrite for UvfitsWriter {
                         });
                 }
 
-                Self::write_vis_row_inner(self.fptr, &mut self.current_num_rows, &mut self.buffer)?;
+                Self::write_vis_row_inner(
+                    &mut self.fptr,
+                    &mut self.current_num_rows,
+                    &mut self.buffer,
+                )?;
             }
         }
 
@@ -1133,8 +1230,9 @@ impl VisWrite for UvfitsWriter {
     }
 }
 
+#[cfg(not(feature = "fitsio-pure"))]
 fn fits_write_int(
-    fptr: *mut fitsio_sys::fitsfile,
+    fptr: &mut FitsOut,
     keyname: &str,
     value: i64,
     comment: Option<&str>,
@@ -1148,7 +1246,7 @@ fn fits_write_int(
     unsafe {
         // ffukyj = fits_update_key_lng
         fitsio_sys::ffukyj(
-            fptr,                                                    /* I - FITS file pointer  */
+            *fptr,                                                   /* I - FITS file pointer  */
             keyname.as_ptr(),                                        /* I - keyword name       */
             value,                                                   /* I - keyword value      */
             comment.map(|c| c.as_ptr()).unwrap_or(std::ptr::null()), /* I - keyword comment    */
@@ -1159,8 +1257,9 @@ fn fits_write_int(
     Ok(())
 }
 
+#[cfg(not(feature = "fitsio-pure"))]
 fn fits_write_double(
-    fptr: *mut fitsio_sys::fitsfile,
+    fptr: &mut FitsOut,
     keyname: &str,
     value: f64,
     comment: Option<&str>,
@@ -1174,7 +1273,7 @@ fn fits_write_double(
     unsafe {
         // ffukyd = fits_update_key_dbl
         fitsio_sys::ffukyd(
-            fptr,                                                    /* I - FITS file pointer  */
+            *fptr,                                                   /* I - FITS file pointer  */
             keyname.as_ptr(),                                        /* I - keyword name       */
             value,                                                   /* I - keyword value      */
             -15,                                                     /* I - no of decimals     */
@@ -1187,8 +1286,9 @@ fn fits_write_double(
     Ok(())
 }
 
+#[cfg(not(feature = "fitsio-pure"))]
 fn fits_write_string(
-    fptr: *mut fitsio_sys::fitsfile,
+    fptr: &mut FitsOut,
     keyname: &str,
     value: &str,
     comment: Option<&str>,
@@ -1203,7 +1303,7 @@ fn fits_write_string(
     unsafe {
         // ffukys = fits_update_key_str
         fitsio_sys::ffukys(
-            fptr,                                                    /* I - FITS file pointer  */
+            *fptr,                                                   /* I - FITS file pointer  */
             keyname.as_ptr(),                                        /* I - keyword name       */
             value.as_ptr(),                                          /* I - keyword value      */
             comment.map(|c| c.as_ptr()).unwrap_or(std::ptr::null()), /* I - keyword comment    */
@@ -1214,16 +1314,14 @@ fn fits_write_string(
     Ok(())
 }
 
-fn fits_write_comment(
-    fptr: *mut fitsio_sys::fitsfile,
-    comment: &str,
-) -> Result<(), FitsioOrCStringError> {
+#[cfg(not(feature = "fitsio-pure"))]
+fn fits_write_comment(fptr: &mut FitsOut, comment: &str) -> Result<(), FitsioOrCStringError> {
     let mut status = 0;
     let comment = CString::new(comment)?;
     unsafe {
         // ffpcom = fits_write_comment
         fitsio_sys::ffpcom(
-            fptr,
+            *fptr,
             comment.as_ptr(), /* I - comment string      */
             &mut status,      /* IO - error status       */
         );
@@ -1232,16 +1330,14 @@ fn fits_write_comment(
     Ok(())
 }
 
-fn fits_write_history(
-    fptr: *mut fitsio_sys::fitsfile,
-    history: &str,
-) -> Result<(), FitsioOrCStringError> {
+#[cfg(not(feature = "fitsio-pure"))]
+fn fits_write_history(fptr: &mut FitsOut, history: &str) -> Result<(), FitsioOrCStringError> {
     let mut status = 0;
     let history = CString::new(history)?;
     unsafe {
         // ffphis = fits_write_history
         fitsio_sys::ffphis(
-            fptr,
+            *fptr,
             history.as_ptr(), /* I - history string     */
             &mut status,      /* IO - error status      */
         );
@@ -1250,10 +1346,62 @@ fn fits_write_history(
     Ok(())
 }
 
+#[cfg(feature = "fitsio-pure")]
+fn fits_write_int(
+    fptr: &mut FitsOut,
+    keyname: &str,
+    value: i64,
+    comment: Option<&str>,
+) -> Result<(), FitsioOrCStringError> {
+    Ok(uvfits_pure::update_key(
+        fptr,
+        keyname,
+        Value::Integer(value),
+        comment,
+    )?)
+}
+
+#[cfg(feature = "fitsio-pure")]
+fn fits_write_double(
+    fptr: &mut FitsOut,
+    keyname: &str,
+    value: f64,
+    comment: Option<&str>,
+) -> Result<(), FitsioOrCStringError> {
+    Ok(uvfits_pure::update_key(
+        fptr,
+        keyname,
+        // Rounded to the 15 digits ffukyd writes, so the card matches cfitsio's.
+        Value::Float(cfitsio_rounded(value)),
+        comment,
+    )?)
+}
+
+#[cfg(feature = "fitsio-pure")]
+fn fits_write_string(
+    fptr: &mut FitsOut,
+    keyname: &str,
+    value: &str,
+    comment: Option<&str>,
+) -> Result<(), FitsioOrCStringError> {
+    let value = Value::String(value.to_string());
+    Ok(uvfits_pure::update_key(fptr, keyname, value, comment)?)
+}
+
+#[cfg(feature = "fitsio-pure")]
+fn fits_write_comment(fptr: &mut FitsOut, comment: &str) -> Result<(), FitsioOrCStringError> {
+    Ok(uvfits_pure::write_commentary(fptr, b"COMMENT ", comment)?)
+}
+
+#[cfg(feature = "fitsio-pure")]
+fn fits_write_history(fptr: &mut FitsOut, history: &str) -> Result<(), FitsioOrCStringError> {
+    Ok(uvfits_pure::write_commentary(fptr, b"HISTORY ", history)?)
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(super) enum FitsioOrCStringError {
     #[error(transparent)]
-    Fitsio(#[from] fitsio::errors::Error),
+    Fitsio(#[from] FitsError),
 
     #[error(transparent)]
     Nul(#[from] std::ffi::NulError),
@@ -1263,11 +1411,11 @@ pub(super) enum FitsioOrCStringError {
 mod tests {
     use std::io::Read;
 
-    use approx::{abs_diff_eq, assert_abs_diff_eq};
-    use fitsio::{
+    use crate::fits_backend::{
         hdu::{FitsHdu, HduInfo},
         FitsFile,
     };
+    use approx::{abs_diff_eq, assert_abs_diff_eq};
     use mwalib::{
         _get_fits_col, _get_required_fits_key, fits_open, fits_open_hdu, get_fits_col,
         get_required_fits_key, CorrelatorContext,
@@ -1283,6 +1431,56 @@ mod tests {
         selection::VisSelection,
         ENH,
     };
+
+    /// Fill `out` with the parameters of the 1-indexed random group `group`,
+    /// unscaled, as cfitsio's `ffggpe` reads them.
+    fn read_group_params(fptr: &mut FitsFile, group: usize, out: &mut [f32]) {
+        #[cfg(not(feature = "fitsio-pure"))]
+        unsafe {
+            let mut status = 0;
+            // ffggpe = fits_read_grppar_flt
+            fitsio_sys::ffggpe(
+                fptr.as_raw(),    /* I - FITS file pointer                       */
+                group as i64,     /* I - group to read (1 = 1st group)           */
+                1,                /* I - first vector element to read (1 = 1st)  */
+                out.len() as i64, /* I - number of values to read                */
+                out.as_mut_ptr(), /* O - array of values that are returned       */
+                &mut status,      /* IO - error status                           */
+            );
+            fits_check_status(status).unwrap();
+        }
+        #[cfg(feature = "fitsio-pure")]
+        fptr.primary_hdu()
+            .unwrap()
+            .read_group_params(fptr, group - 1, 0, out)
+            .unwrap();
+    }
+
+    /// Fill `out` with the data array of the 1-indexed random group `group`,
+    /// as cfitsio's `ffgpve` reads it.
+    fn read_group_data(fptr: &mut FitsFile, group: usize, out: &mut [f32]) {
+        #[cfg(not(feature = "fitsio-pure"))]
+        unsafe {
+            let mut status = 0;
+            // ffgpve = fits_read_sel_flt
+            fitsio_sys::ffgpve(
+                fptr.as_raw(),    /* I - FITS file pointer                       */
+                group as i64,     /* I - group to read (1 = 1st group)           */
+                1,                /* I - first vector element to read (1 = 1st)  */
+                out.len() as i64, /* I - number of values to read                */
+                0.0,              /* I - value for undefined pixels              */
+                out.as_mut_ptr(), /* O - array of values that are returned       */
+                &mut 0,           /* O - set to 1 if any values are null; else 0 */
+                &mut status,      /* IO - error status                           */
+            );
+            fits_check_status(status).unwrap();
+        }
+        #[cfg(feature = "fitsio-pure")]
+        fptr.primary_hdu()
+            .unwrap()
+            .read_group_data(fptr, group - 1, 0, out)
+            .unwrap();
+    }
 
     macro_rules! assert_short_string_keys_eq {
         ($keys:expr, $left_fptr:expr, $left_hdu:expr, $right_fptr:expr, $right_hdu:expr) => {
@@ -1615,7 +1813,6 @@ mod tests {
         let mut right_group_params: Vec<f32> = vec![0.0; pcount];
         let mut left_vis: Vec<f32> = vec![0.0; num_fine_freq_chans * num_pols * floats_per_pol];
         let mut right_vis: Vec<f32> = vec![0.0; num_fine_freq_chans * num_pols * floats_per_pol];
-        let mut status = 0;
 
         let baseline_col_num = column_info
             .iter()
@@ -1623,28 +1820,8 @@ mod tests {
             .unwrap();
 
         for row_idx in 0..group_len {
-            unsafe {
-                // ffggpe = fits_read_grppar_flt
-                fitsio_sys::ffggpe(
-                    left_fptr.as_raw(),             /* I - FITS file pointer                       */
-                    1 + row_idx as i64, /* I - group to read (1 = 1st group)           */
-                    1,                  /* I - first vector element to read (1 = 1st)  */
-                    pcount as i64,      /* I - number of values to read                */
-                    left_group_params.as_mut_ptr(), /* O - array of values that are returned       */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status).unwrap();
-                // ffggpe = fits_read_grppar_flt
-                fitsio_sys::ffggpe(
-                    right_fptr.as_raw(),             /* I - FITS file pointer                       */
-                    1 + row_idx as i64, /* I - group to read (1 = 1st group)           */
-                    1,                  /* I - first vector element to read (1 = 1st)  */
-                    pcount as i64,      /* I - number of values to read                */
-                    right_group_params.as_mut_ptr(), /* O - array of values that are returned       */
-                    &mut status, /* IO - error status                           */
-                );
-                fits_check_status(status).unwrap();
-            }
+            read_group_params(left_fptr, row_idx + 1, &mut left_group_params);
+            read_group_params(right_fptr, row_idx + 1, &mut right_group_params);
 
             for (param_name, left_group_param, right_group_param) in
                 izip!(&column_info, &left_group_params, &right_group_params)
@@ -1661,33 +1838,8 @@ mod tests {
                 continue;
             }
 
-            unsafe {
-                // ffgpve = fits_read_sel_flt
-                fitsio_sys::ffgpve(
-                    left_fptr.as_raw(),    /* I - FITS file pointer                       */
-                    1 + row_idx as i64,    /* I - group to read (1 = 1st group)           */
-                    1,                     /* I - first vector element to read (1 = 1st)  */
-                    left_vis.len() as i64, /* I - number of values to read                */
-                    0.0,                   /* I - value for undefined pixels              */
-                    left_vis.as_mut_ptr(), /* O - array of values that are returned       */
-                    &mut 0,                /* O - set to 1 if any values are null; else 0 */
-                    &mut status,           /* IO - error status                           */
-                );
-                fits_check_status(status).unwrap();
-
-                // ffgpve = fits_read_sel_flt
-                fitsio_sys::ffgpve(
-                    right_fptr.as_raw(),    /* I - FITS file pointer                       */
-                    1 + row_idx as i64,     /* I - group to read (1 = 1st group)           */
-                    1,                      /* I - first vector element to read (1 = 1st)  */
-                    right_vis.len() as i64, /* I - number of values to read                */
-                    0.0,                    /* I - value for undefined pixels              */
-                    right_vis.as_mut_ptr(), /* O - array of values that are returned       */
-                    &mut 0,                 /* O - set to 1 if any values are null; else 0 */
-                    &mut status,            /* IO - error status                           */
-                );
-                fits_check_status(status).unwrap();
-            }
+            read_group_data(left_fptr, row_idx + 1, &mut left_vis);
+            read_group_data(right_fptr, row_idx + 1, &mut right_vis);
 
             for (vis_idx, (left_val, right_val)) in izip!(&left_vis, &right_vis).enumerate() {
                 assert!(
@@ -2701,30 +2853,8 @@ mod tests {
 
         let mut no_inttim_group_params: Vec<f32> = vec![0.0; GROUP_PARAMS.len() - 1];
         let mut inttim_group_params: Vec<f32> = vec![0.0; GROUP_PARAMS.len()];
-        let mut status = 0;
-
-        unsafe {
-            // ffggpe = fits_read_grppar_flt
-            fitsio_sys::ffggpe(
-                no_inttim.as_raw(), /* I - FITS file pointer                       */
-                1,                  /* I - group to read (1 = 1st group)           */
-                1,                  /* I - first vector element to read (1 = 1st)  */
-                no_inttim_group_params.len() as i64, /* I - number of values to read                */
-                no_inttim_group_params.as_mut_ptr(), /* O - array of values that are returned       */
-                &mut status, /* IO - error status                           */
-            );
-            fits_check_status(status).unwrap();
-            // ffggpe = fits_read_grppar_flt
-            fitsio_sys::ffggpe(
-                inttim.as_raw(),                  /* I - FITS file pointer                       */
-                1,                                /* I - group to read (1 = 1st group)           */
-                1,                                /* I - first vector element to read (1 = 1st)  */
-                inttim_group_params.len() as i64, /* I - number of values to read                */
-                inttim_group_params.as_mut_ptr(), /* O - array of values that are returned       */
-                &mut status,                      /* IO - error status                           */
-            );
-            fits_check_status(status).unwrap();
-        }
+        read_group_params(&mut no_inttim, 1, &mut no_inttim_group_params);
+        read_group_params(&mut inttim, 1, &mut inttim_group_params);
 
         let mut i_no_inttim = 0;
         let mut i_inttim = 0;
@@ -2836,30 +2966,8 @@ mod tests {
 
         let mut precession_group_params: Vec<f32> = vec![0.0; GROUP_PARAMS.len() - 1];
         let mut no_precession_group_params: Vec<f32> = vec![0.0; GROUP_PARAMS.len() - 1];
-        let mut status = 0;
-
-        unsafe {
-            // ffggpe = fits_read_grppar_flt
-            fitsio_sys::ffggpe(
-                precession.as_raw(), /* I - FITS file pointer                       */
-                2,                   /* I - group to read (1 = 1st group)           */
-                1,                   /* I - first vector element to read (1 = 1st)  */
-                precession_group_params.len() as i64, /* I - number of values to read                */
-                precession_group_params.as_mut_ptr(), /* O - array of values that are returned       */
-                &mut status, /* IO - error status                           */
-            );
-            fits_check_status(status).unwrap();
-            // ffggpe = fits_read_grppar_flt
-            fitsio_sys::ffggpe(
-                no_precession.as_raw(), /* I - FITS file pointer                       */
-                2,                      /* I - group to read (1 = 1st group)           */
-                1,                      /* I - first vector element to read (1 = 1st)  */
-                no_precession_group_params.len() as i64, /* I - number of values to read                */
-                no_precession_group_params.as_mut_ptr(), /* O - array of values that are returned       */
-                &mut status, /* IO - error status                           */
-            );
-            fits_check_status(status).unwrap();
-        }
+        read_group_params(&mut precession, 2, &mut precession_group_params);
+        read_group_params(&mut no_precession, 2, &mut no_precession_group_params);
         for (i, &param) in GROUP_PARAMS.iter().enumerate() {
             match param {
                 "INTTIM" | "UU" | "VV" => continue,

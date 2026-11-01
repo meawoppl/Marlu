@@ -51,7 +51,7 @@ pub enum MeasurementSetWriteError {
 }
 
 #[derive(Error, Debug)]
-#[cfg(feature = "cfitsio")]
+#[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))]
 pub enum UvfitsWriteError {
     /// An error when trying to write to an unexpected row.
     #[error("Tried to write to row number {row_num}, but only {num_rows} rows are expected")]
@@ -73,7 +73,7 @@ pub enum UvfitsWriteError {
 
     /// An error associated with fitsio.
     #[error(transparent)]
-    Fitsio(#[from] fitsio::errors::Error),
+    Fitsio(#[from] crate::fits_backend::errors::Error),
 
     /// An error when converting a Rust string to a C string.
     #[error(transparent)]
@@ -84,7 +84,7 @@ pub enum UvfitsWriteError {
     StdIo(#[from] std::io::Error),
 }
 
-#[cfg(feature = "cfitsio")]
+#[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))]
 impl From<crate::io::uvfits::FitsioOrCStringError> for UvfitsWriteError {
     fn from(e: crate::io::uvfits::FitsioOrCStringError) -> Self {
         match e {
@@ -109,12 +109,12 @@ pub enum IOError {
     FitsError(#[from] mwalib::FitsError),
 
     #[error(transparent)]
-    #[cfg(feature = "cfitsio")]
+    #[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))]
     /// Error derived from [`fitsio::errors::Error`]
-    FitsioError(#[from] fitsio::errors::Error),
+    FitsioError(#[from] crate::fits_backend::errors::Error),
 
     #[error(transparent)]
-    #[cfg(feature = "cfitsio")]
+    #[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))]
     /// Error derived from [`io::errors::UvfitsWriteError`]
     UvfitsWriteError(#[from] UvfitsWriteError),
 

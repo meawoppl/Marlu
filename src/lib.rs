@@ -41,7 +41,7 @@ pub mod sexagesimal;
 pub mod io;
 #[cfg(feature = "ms")]
 pub use io::ms;
-#[cfg(feature = "cfitsio")]
+#[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))]
 pub use io::uvfits;
 pub use io::VisWrite;
 
@@ -76,15 +76,26 @@ pub mod built_info {
 }
 
 // If "mwalib" is enabled, re-export the crate here, as well its re-exported
-// crates.
+// crates. With "fitsio-pure", mwalib's `fitsio` is fitsio-pure's
+// fitsio-compatible API, and there is no `fitsio_sys`.
 cfg_if::cfg_if! {
-    if #[cfg(feature = "mwalib")] {
+    if #[cfg(all(feature = "mwalib", feature = "fitsio-pure"))] {
+        pub use mwalib;
+        pub use mwalib::{fitsio, fitsio_pure};
+    } else if #[cfg(feature = "mwalib")] {
         pub use mwalib;
         pub use mwalib::{fitsio, fitsio_sys};
     }
 }
 
-#[cfg(feature = "cfitsio")]
+// The fitsio API the uvfits code is written against: the `fitsio` crate
+// (cfitsio), or fitsio-pure's fitsio-compatible API with "fitsio-pure".
+#[cfg(all(feature = "cfitsio", not(feature = "fitsio-pure")))]
+pub(crate) use fitsio as fits_backend;
+#[cfg(feature = "fitsio-pure")]
+pub(crate) use fitsio_pure::compat as fits_backend;
+
+#[cfg(any(feature = "cfitsio", feature = "fitsio-pure"))]
 pub use io::{UvfitsWriteError, UvfitsWriter};
 
 // If "ms" is enabled, re-export rubbl_casatables here.
